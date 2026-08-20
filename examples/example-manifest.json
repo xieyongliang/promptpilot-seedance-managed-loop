@@ -1,0 +1,31 @@
+{
+  "example": true,
+  "not_a_live_result": true,
+  "strategy": "llm-direct-video-eval-focused-repair-best-of-n",
+  "run_id": "example-run",
+  "target_score": 3.5,
+  "completed_rounds": 1,
+  "generated_candidates": 2,
+  "passed": true,
+  "best_candidate": {
+    "round": 1,
+    "candidate": 2,
+    "task_id": "redacted",
+    "evaluator_model": "seed-2-0-lite-260428",
+    "audio_tokens": 64,
+    "score": 4.0,
+    "confidence": 0.9,
+    "evaluation": {
+      "summary": "Example evaluator output.",
+      "passed_requirements": [
+        "The required first-person viewpoint is maintained."
+      ],
+      "failed_requirements": [
+        "A minor continuity defect remains."
+      ],
+      "highest_priority_failure": "A minor continuity defect remains.",
+      "improvement_instruction": "Repair only the continuity defect while preserving all passed requirements."
+    }
+  },
+  "security_note": "Illustrative schema only; resource IDs, paths, and temporary signed URLs are omitted."
+}

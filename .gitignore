@@ -1,0 +1,17 @@
+.DS_Store
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+*.mp4
+*.mov
+*.part
+runs/
+outputs/
+secrets/
+*.key
+*.pem
+

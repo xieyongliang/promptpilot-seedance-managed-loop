@@ -26,30 +26,62 @@ class ManagedVideoLoopTests(unittest.TestCase):
         self.assertEqual(result["failed_requirements"], ["missing speech"])
         self.assertEqual(result["audio_evidence"], [])
 
-    def test_evaluate_video_sends_direct_multimodal_input(self):
-        captured = {}
+    def test_two_stage_evaluation_sends_video_only_to_analysis(self):
+        captured = []
 
         def fake_call(payload, timeout=300):
-            captured.update(payload)
+            captured.append(payload)
+            if len(captured) == 1:
+                return {
+                    "response_id": "analysis-1",
+                    "model": "analysis-model",
+                    "usage": {"input_tokens_details": {"audio_tokens": 12}},
+                    "result": {"summary": "observed", "audio_evidence": ["music"]},
+                }
             return {
-                "response_id": "resp-1",
-                "model": "seed-2-0-lite-260428",
-                "usage": {"input_tokens_details": {"audio_tokens": 12}},
+                "response_id": "eval-1",
+                "model": "evaluator-model",
+                "usage": {},
                 "result": {"score": 3.7, "confidence": 0.8},
             }
 
         with patch.object(loop, "call_responses", side_effect=fake_call):
-            result = loop.evaluate_video(
-                "https://example.test/video.mp4", "test brief", "evaluator-model"
+            analysis = loop.analyze_video(
+                "https://example.test/video.mp4", "test brief", "analysis-model"
+            )
+            result = loop.evaluate_video_analysis(
+                "test brief", analysis["analysis"], "evaluator-model"
             )
 
-        content = captured["input"][0]["content"]
-        self.assertEqual(captured["model"], "evaluator-model")
-        self.assertEqual(content[0]["type"], "input_video")
-        self.assertEqual(content[0]["video_url"], "https://example.test/video.mp4")
+        analysis_content = captured[0]["input"][0]["content"]
+        evaluation_content = captured[1]["input"][0]["content"]
+        self.assertEqual(captured[0]["model"], "analysis-model")
+        self.assertEqual(analysis_content[0]["type"], "input_video")
+        self.assertEqual(
+            analysis_content[0]["video_url"], "https://example.test/video.mp4"
+        )
+        self.assertEqual(captured[1]["model"], "evaluator-model")
+        self.assertEqual([item["type"] for item in evaluation_content], ["input_text"])
+        self.assertIn("OBSERVABLE EVIDENCE REPORT", evaluation_content[0]["text"])
         self.assertEqual(result["evaluation"]["score"], 3.7)
 
     def test_loop_selects_best_candidate_and_stops_at_target(self):
+        analyses = iter(
+            [
+                {
+                    "response_id": "analysis-1",
+                    "model": "analysis-model",
+                    "usage": {"input_tokens_details": {"audio_tokens": 10}},
+                    "analysis": {"summary": "candidate 1 evidence"},
+                },
+                {
+                    "response_id": "analysis-2",
+                    "model": "analysis-model",
+                    "usage": {"input_tokens_details": {"audio_tokens": 14}},
+                    "analysis": {"summary": "candidate 2 evidence"},
+                },
+            ]
+        )
         evaluations = iter(
             [
                 {
@@ -103,7 +135,9 @@ class ManagedVideoLoopTests(unittest.TestCase):
                 "content": {"video_url": f"https://example.test/{task_id}.mp4"},
             },
         ), patch.object(
-            loop, "evaluate_video", side_effect=lambda *_: next(evaluations)
+            loop, "analyze_video", side_effect=lambda *_: next(analyses)
+        ), patch.object(
+            loop, "evaluate_video_analysis", side_effect=lambda *_: next(evaluations)
         ), patch.object(
             loop,
             "download_video",

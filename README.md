@@ -1,14 +1,15 @@
 # Seedance Managed Video Loop
 
-A standalone BytePlus ModelArk workflow for iterative video generation and direct multimodal evaluation.
+A BytePlus ModelArk workflow for iterative video generation and two-stage evaluation inside a Managed Agent.
 
-The loop uses three model roles:
+The recommended Managed Agent loop uses four roles:
 
 1. A text LLM generates or revises a production-ready Seedance prompt.
 2. Seedance generates multiple candidates from the same prompt.
-3. A multimodal LLM receives each generated video through `input_video`, watches and listens to it, and returns a structured score with evidence and one highest-priority improvement.
+3. A multimodal LLM receives each video through `input_video` and returns compact observable AV evidence.
+4. The MA main model reads the evidence and scores it directly, returning one highest-priority improvement.
 
-The runner selects the best candidate, applies focused feedback, and stops when the target score is reached. It runs locally or inside a ModelArk Managed Agent Cloud Environment without an external prompt/evaluation service or a public MCP server.
+The MA main model orchestrates candidate selection, focused feedback, and early stopping. `managed_video_loop.py` supplies the generation and video-analysis operations; no external evaluation service or public MCP server is required.
 
 ## Defaults
 
@@ -20,7 +21,8 @@ The runner selects the best candidate, applies focused feedback, and stops when 
 | `--timeout` | `1200` | Per-video polling timeout in seconds |
 | `--video-model` | `dreamina-seedance-2-5-260628` | Seedance generation model |
 | `--prompt-model` | `seed-2-0-lite-260428` | Text prompt-agent model |
-| `--evaluator-model` | `seed-2-0-lite-260428` | Direct multimodal evaluator model |
+| `--analysis-model` | `seed-2-0-lite-260428` | Multimodal AV evidence model |
+| `--evaluator-model` | `seed-2-0-lite-260428` | Standalone-runner evaluator; the recommended MA path uses the MA main model instead |
 
 All values are user-configurable CLI options.
 
@@ -44,6 +46,7 @@ Override the policy or models when needed:
   --target-score 4.2 \
   --timeout 1800 \
   --prompt-model seed-2-0-lite-260428 \
+  --analysis-model seed-2-0-lite-260428 \
   --evaluator-model seed-2-0-lite-260428
 ```
 
@@ -55,14 +58,14 @@ Run the offline tests without API calls or video charges:
 
 ## Managed Agent
 
-The recommended MA architecture uploads `managed_video_loop.py` as a Session Resource and executes it through the Agent's default bash tool. `ARK_API_KEY` is injected with an MA Vault credential. The evaluator is an LLM role invoked by the runner through the ModelArk Responses API with direct video input.
+The recommended MA architecture uploads `managed_video_loop.py` as a Session Resource and uses it from the Agent's default bash tool. `ARK_API_KEY` is injected with an MA Vault credential. For each candidate, the Agent calls `/responses` with `input_video` to extract compact AV evidence. The MA main model then reads that evidence and performs rubric scoring directly.
 
 - [English guide](docs/guide.en.md)
 - [中文指南](docs/guide.zh-CN.md)
 
 ## Evaluation Contract
 
-The evaluator returns JSON containing:
+The two stages together produce JSON containing:
 
 - score from 0 to 5 and confidence from 0 to 1
 - timestamped timeline and visual evidence
@@ -71,7 +74,7 @@ The evaluator returns JSON containing:
 - continuity and unintended-text findings
 - one highest-priority failure and one focused repair instruction
 
-The evaluator must judge observable evidence and must not infer audio solely from visuals.
+The analysis stage must not infer audio solely from visuals. The MA main-model scoring stage judges the supplied evidence against the source brief.
 
 ## Security
 
@@ -83,6 +86,7 @@ The evaluator must judge observable evidence and must not infer audio solely fro
 ## Verification Status
 
 - The standalone runner compiles and starts with only `requests` as a direct dependency.
-- Offline tests validate structured response parsing, direct video-evaluation payloads, defaults, and focused-repair selection.
+- Offline tests validate structured response parsing, the standalone two-call fallback, defaults, and focused-repair selection.
 - ArkCLI dry-run validates the MA Cloud Environment setup and default bash/read/write toolset.
-- A real MA Cloud Session execution remains the final end-to-end validation step for this revised implementation.
+- Direct `seed-2-0-lite + input_video` evaluation through the Responses API is verified.
+- A real MA Cloud Session completed the recommended path: `/responses + input_video` extracted AV evidence, and the MA main model read that evidence and returned the score directly.

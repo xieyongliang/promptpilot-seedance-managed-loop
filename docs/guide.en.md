@@ -1,6 +1,6 @@
 # ArkCLI + Managed Agent: Video Generation, Direct Evaluation, and Continuous Improvement
 
-This guide presents a reproducible BytePlus ModelArk workflow. A Managed Agent runs one Python file inside a Cloud Environment. A text LLM generates or revises the Seedance prompt, Seedance produces multiple candidates, and a multimodal LLM receives each video through `input_video`, watches and listens to it, and scores it directly. When the best candidate misses the target, the runner repairs only the highest-priority defect and starts another round.
+This guide presents a reproducible BytePlus ModelArk workflow. A Managed Agent orchestrates one Python module inside a Cloud Environment. A text LLM generates or revises the Seedance prompt, and Seedance produces multiple candidates. Evaluation has two stages: `/responses + input_video` extracts compact AV evidence, then the MA main model reads and scores that evidence directly. When the best candidate misses the target, the MA main model repairs only the highest-priority defect and starts another round.
 
 The default policy uses at most five rounds, two candidates per round, and a target score of 3.5 out of 5. Every value is user-configurable.
 
@@ -15,14 +15,15 @@ flowchart TB
     CLI --> MA["ModelArk Managed Agent<br/>Cloud Environment + bash"]
     VAULT["MA Vault<br/>Inject ARK_API_KEY"] --> MA
 
-    MA --> RUNNER["managed_video_loop.py"]
+    MA --> RUNNER["managed_video_loop.py<br/>Generation and video-analysis operations"]
     RUNNER --> PA["Prompt Agent<br/>Text LLM generates or revises prompt"]
     PA --> SD["Seedance<br/>Generate N candidates from one prompt"]
     SD --> C1["Candidate video 1"]
     SD --> C2["Candidate video N"]
-    C1 --> EA["Evaluator Agent<br/>Multimodal LLM + input_video"]
+    C1 --> EA["Analysis Agent<br/>Multimodal LLM + input_video"]
     C2 --> EA
-    EA --> SCORE["Structured evidence, 0-5 score, confidence"]
+    EA --> EV["MA main model scores directly<br/>Brief + evidence JSON"]
+    EV --> SCORE["0-5 score, confidence, repair"]
     SCORE --> BEST["Select by score + confidence"]
     BEST --> CHECK{"Best score >= target?"}
     CHECK -->|"Yes"| DONE["Download best video and stop"]
@@ -39,11 +40,11 @@ flowchart TB
     class MA,VAULT,RUNNER control;
     class PA prompt;
     class SD,C1,C2 video;
-    class EA,SCORE eval;
+    class EA,EV,SCORE eval;
     class BEST,CHECK,FIX,DONE decision;
 ```
 
-Important boundary: a video URL in an MA text message is still only text. The runner calls the ModelArk Responses API and sends the temporary URL as `input_video.video_url`. This is the step that performs actual video and audio evaluation.
+Important boundary: a video URL in an MA text message is still only text. The Responses call sends the complete temporary signed URL as `input_video.video_url` and extracts AV evidence. The current MA main model handles the second stage by reading and scoring that evidence JSON directly.
 
 ## 2. Repository Layout
 
@@ -63,7 +64,7 @@ seedance-managed-video-loop/
     └── example-manifest.json
 ```
 
-`managed_video_loop.py` is the only runtime entry point. It contains prompt generation, Seedance submission and polling, direct video evaluation, candidate selection, focused repair, early stopping, and video download.
+`managed_video_loop.py` provides prompt generation, Seedance submission and polling, video-evidence extraction, and standalone execution. In the recommended MA path, the Agent invokes those operations while the MA main model performs evidence scoring, candidate selection, focused repair, and early stopping.
 
 ## 3. Defaults and User Configuration
 
@@ -75,7 +76,8 @@ seedance-managed-video-loop/
 | `--timeout` | `1200` | Per-video polling timeout in seconds |
 | `--video-model` | `dreamina-seedance-2-5-260628` | Video generation model |
 | `--prompt-model` | `seed-2-0-lite-260428` | Prompt-agent model |
-| `--evaluator-model` | `seed-2-0-lite-260428` | Direct video evaluator model |
+| `--analysis-model` | `seed-2-0-lite-260428` | Multimodal AV evidence model |
+| `--evaluator-model` | `seed-2-0-lite-260428` | Standalone fallback only; the recommended MA path uses the MA main model |
 
 Run with defaults:
 
@@ -92,6 +94,7 @@ python managed_video_loop.py \
   --target-score 4.2 \
   --timeout 1800 \
   --prompt-model seed-2-0-lite-260428 \
+  --analysis-model seed-2-0-lite-260428 \
   --evaluator-model seed-2-0-lite-260428
 ```
 
@@ -159,16 +162,16 @@ Run the offline tests without API calls or video charges:
 2. The runner appends the source brief as a non-negotiable constraint so later revisions cannot drift.
 3. Seedance generates independent candidates from exactly the same prompt.
 4. The runner polls each task and retrieves its temporary `video_url`.
-5. The Evaluator Agent watches and listens to each candidate through `input_video`.
-6. The evaluator returns structured evidence, score, confidence, passed requirements, and failed requirements.
-7. The runner selects the best candidate by `(score, confidence)`.
+5. The Analysis Agent watches and listens through one `/responses + input_video` call, returning compact evidence without a score.
+6. The MA main model reads the brief and evidence JSON directly, then returns the score, confidence, passed requirements, and failed requirements.
+7. The MA main model selects the best candidate by `(score, confidence)`.
 8. It stops at the target or passes one highest-priority defect to the next Prompt Agent round.
 
 Default priority signals cover exact speech, viewpoint, unintended text, timeline actions, continuity, and audio. The evaluator also returns `highest_priority_failure` for focused repair.
 
-## 7. Direct Video Evaluation Contract
+## 7. Two-Stage Video Evaluation Contract
 
-The evaluator must score observable evidence and must not infer sound from visuals. It returns JSON with:
+The Analysis Agent must not infer sound from visuals. It returns timeline, visual evidence, audio evidence, exact speech, continuity, and unintended text. The MA main model reads that report and scores it directly against the source brief. The merged result contains:
 
 - `score` from 0 to 5
 - `confidence` from 0 to 1
@@ -205,6 +208,7 @@ runs/<run-id>/
     ├── candidate-01/
     │   ├── seedance_submit.json
     │   ├── seedance_result.json
+    │   ├── llm_video_analysis.json
     │   ├── llm_video_evaluation.json
     │   └── summary.json
     └── candidate-02/
@@ -309,10 +313,9 @@ The file is mounted at:
 ```bash
 arkcli agent session events send "$SESSION_ID" \
   --type user.message \
-  --text 'Run the mounted video loop. Use max 5 rounds, 2 candidates per round, target score 3.5, and timeout 1200 seconds. Never print credentials. Return the final manifest summary and selected video path.' \
+  --text 'Orchestrate the mounted video loop with max 5 rounds, 2 candidates per round, target score 3.5, and timeout 1200 seconds. For each candidate call analyze_video to obtain observable evidence. Then read that evidence and score it directly with your MA main model. Never print credentials. Return the final manifest summary and selected video path.' \
   --poll \
-  --wait-timeout 7200 \
-  --format json
+  --wait-timeout 7200
 ```
 
 If polling times out, continue reading the same Session instead of sending the task again:
@@ -326,10 +329,11 @@ arkcli +tail "$SESSION_ID"
 
 - The Prompt Agent produces a directly executable Seedance prompt.
 - Candidates in one round use the same prompt but have different task IDs.
-- The evaluator request contains `input_video` and returns AV evidence.
+- The Analysis Agent request contains the complete signed URL and `input_video`, returning AV evidence.
+- The MA main model reads the video-analysis evidence and performs scoring directly.
 - `audio_tokens > 0`, with speech, music, or sound-effect findings.
-- The evaluator returns a 0-5 score, confidence, and highest-priority failure.
-- The runner selects correctly, stops at the target, and repairs only one defect when below it.
+- The MA main model returns a 0-5 score, confidence, and highest-priority failure.
+- The MA orchestration selects correctly, stops at the target, and repairs only one defect when below it.
 - The total rounds never exceed the user configuration.
 - Agent Session events show the bash invocation and runner output.
 - The Agent requires no public MCP endpoint.
@@ -347,4 +351,4 @@ arkcli +tail "$SESSION_ID"
 - Python compilation and CLI defaults are verified.
 - Offline simulations cover prompt parsing, direct video-evaluation payloads, candidate selection, and focused repair.
 - The MA Environment and Agent requests can be validated with ArkCLI `--dry-run`.
-- This revised direct-evaluation implementation still needs one real MA Cloud Session run for final end-to-end validation.
+- A real MA Cloud Session completed the full `/responses` video-understanding and MA main-model direct-scoring workflow.

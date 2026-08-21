@@ -21,6 +21,7 @@ RUNS_DIR = ROOT / "runs"
 DEFAULT_ARK_BASE_URL = "https://ark.ap-southeast.bytepluses.com/api/v3"
 DEFAULT_VIDEO_MODEL = "dreamina-seedance-2-5-260628"
 DEFAULT_PROMPT_MODEL = "seed-2-0-lite-260428"
+DEFAULT_ANALYSIS_MODEL = "seed-2-0-lite-260428"
 DEFAULT_EVALUATOR_MODEL = "seed-2-0-lite-260428"
 
 DEFAULT_BRIEF = """Create an 11-second, 16:9 first-person POV fruit-tea promotional video with generated audio. Use Reference Video 1 for first-person framing and motion language and Reference Audio 1 as continuous background music. From 0-2 seconds, use Reference Image 1 as the opening and show a hand picking a dew-covered red apple with a crisp apple-tapping sound. From 2-4 seconds, rapidly cut between apple chunks entering a shaker, ice and tea base being added, and vigorous shaking synchronized with ice clinks and upbeat music; a female voice says exactly: "Fresh-cut, shaken fresh." From 4-6 seconds, pour layered fruit tea into a clear cup, spread milk foam on top, apply the pink product sticker, and move closer to show texture. From 6-8 seconds, raise the drink from Reference Image 2 toward the viewer in a first-person toast; keep the label visible and use a female voice saying exactly: "Take a sip of fresh refreshment." Hold the final frame on Reference Image 2 through 11 seconds. Preserve cup, hand, apple, label, liquid, and foam continuity. Avoid third-person views, extra fingers, morphing, flicker, unreadable labels, unintended text, continuity errors, and audio desynchronization."""
@@ -298,25 +299,35 @@ def normalize_evaluation(value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def evaluate_video(video_url: str, brief: str, model: str) -> dict[str, Any]:
-    instruction = f"""Act as an independent multimodal video evaluation agent. Watch and listen to the supplied video, then score its compliance with the source brief. Judge only observable evidence. Never infer audio from visuals.
+def normalize_analysis(value: dict[str, Any]) -> dict[str, Any]:
+    for key in (
+        "timeline",
+        "visual_evidence",
+        "audio_evidence",
+        "exact_speech",
+        "continuity_issues",
+        "unintended_text",
+    ):
+        current = value.get(key)
+        if current is None:
+            value[key] = []
+        elif not isinstance(current, list):
+            value[key] = [str(current)]
+    return value
+
+
+def analyze_video(video_url: str, brief: str, model: str) -> dict[str, Any]:
+    instruction = f"""Watch and listen to the video. Extract compact observable evidence relevant to the brief. Do not score, recommend changes, or infer audio from visuals.
 
 SOURCE BRIEF:
 {brief}
 
-SCORING RUBRIC:
-- 5: all material requirements pass; no meaningful defects.
-- 4: nearly complete; only minor defects remain.
-- 3: usable but one or more substantial requirements fail.
-- 2: multiple major requirements fail.
-- 1: poor match with little usable compliance.
-- 0: invalid, inaccessible, or unrelated output.
-
-Return JSON with: score (0-5), confidence (0-1), summary, timeline (timestamped claims), visual_evidence, audio_evidence, exact_speech, continuity_issues, unintended_text, passed_requirements, failed_requirements, highest_priority_failure, and improvement_instruction. The improvement instruction must address only the single highest-priority failure while preserving passed requirements."""
+Return concise JSON with: summary, timeline, visual_evidence, audio_evidence, exact_speech, continuity_issues, and unintended_text. Every timeline item must include a timestamp. Use at most 12 timeline items and at most 8 items in every other list."""
     response = call_responses(
         {
             "model": model,
             "stream": False,
+            "max_output_tokens": 1200,
             "text": {"format": {"type": "json_object"}},
             "input": [
                 {
@@ -325,6 +336,48 @@ Return JSON with: score (0-5), confidence (0-1), summary, timeline (timestamped 
                         {"type": "input_video", "video_url": video_url, "fps": 1},
                         {"type": "input_text", "text": instruction},
                     ],
+                }
+            ],
+        }
+    )
+    return {
+        "response_id": response["response_id"],
+        "model": response["model"],
+        "usage": response["usage"],
+        "analysis": normalize_analysis(response["result"]),
+    }
+
+
+def evaluate_video_analysis(
+    brief: str, analysis: dict[str, Any], model: str
+) -> dict[str, Any]:
+    instruction = f"""Act as an independent video evaluation agent. Score the supplied evidence report against the source brief. The report came from a separate video-and-audio understanding call. Judge only that report and do not claim to have watched the video.
+
+SOURCE BRIEF:
+{brief}
+
+OBSERVABLE EVIDENCE REPORT:
+{json.dumps(analysis, ensure_ascii=False)}
+
+SCORING RUBRIC:
+- 5: all material requirements pass; no meaningful defects.
+- 4: nearly complete; only minor defects remain.
+- 3: usable but one or more substantial requirements fail.
+- 2: multiple major requirements fail.
+- 1: poor match with little usable compliance.
+- 0: invalid, inaccessible, or unrelated evidence.
+
+Return concise JSON with: score (0-5), confidence (0-1), summary, passed_requirements, failed_requirements, highest_priority_failure, and improvement_instruction. The improvement instruction must address only the single highest-priority failure while preserving passed requirements."""
+    response = call_responses(
+        {
+            "model": model,
+            "stream": False,
+            "max_output_tokens": 900,
+            "text": {"format": {"type": "json_object"}},
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": instruction}],
                 }
             ],
         }
@@ -390,6 +443,7 @@ class LoopConfig:
     timeout_seconds: int = 1200
     video_model: str = DEFAULT_VIDEO_MODEL
     prompt_model: str = DEFAULT_PROMPT_MODEL
+    analysis_model: str = DEFAULT_ANALYSIS_MODEL
     evaluator_model: str = DEFAULT_EVALUATOR_MODEL
     run_id: str | None = None
 
@@ -460,18 +514,35 @@ def run_loop(config: LoopConfig) -> dict[str, Any]:
             video_result = wait_for_video(task_id, config.timeout_seconds)
             write_json(candidate_dir / "seedance_result.json", video_result)
             video_url = video_result["content"]["video_url"]
-            evaluated = evaluate_video(video_url, config.brief, config.evaluator_model)
+            analyzed = analyze_video(video_url, config.brief, config.analysis_model)
+            write_json(candidate_dir / "llm_video_analysis.json", analyzed)
+            evaluated = evaluate_video_analysis(
+                config.brief, analyzed["analysis"], config.evaluator_model
+            )
             write_json(candidate_dir / "llm_video_evaluation.json", evaluated)
-            evaluation = evaluated["evaluation"]
+            evaluation = {**analyzed["analysis"], **evaluated["evaluation"]}
+            for evidence_key in (
+                "timeline",
+                "visual_evidence",
+                "audio_evidence",
+                "exact_speech",
+                "continuity_issues",
+                "unintended_text",
+            ):
+                evaluation[evidence_key] = analyzed["analysis"].get(evidence_key, [])
             candidate = {
                 "round": round_number,
                 "candidate": candidate_number,
                 "task_id": task_id,
                 "video_url": video_url,
+                "analysis_model": analyzed.get("model"),
                 "evaluator_model": evaluated.get("model"),
-                "audio_tokens": (evaluated.get("usage") or {})
+                "analysis_response_id": analyzed.get("response_id"),
+                "evaluation_response_id": evaluated.get("response_id"),
+                "audio_tokens": (analyzed.get("usage") or {})
                 .get("input_tokens_details", {})
                 .get("audio_tokens"),
+                "analysis": analyzed["analysis"],
                 "score": evaluation["score"],
                 "confidence": evaluation["confidence"],
                 "evaluation": evaluation,
@@ -524,7 +595,7 @@ def run_loop(config: LoopConfig) -> dict[str, Any]:
             break
 
     manifest = {
-        "strategy": "llm-direct-video-eval-focused-repair-best-of-n",
+        "strategy": "two-stage-llm-video-eval-focused-repair-best-of-n",
         "run_id": run_id,
         "run_dir": str(run_dir),
         "target_score": config.target_score,
@@ -561,6 +632,7 @@ def main() -> None:
     )
     parser.add_argument("--video-model", default=DEFAULT_VIDEO_MODEL)
     parser.add_argument("--prompt-model", default=DEFAULT_PROMPT_MODEL)
+    parser.add_argument("--analysis-model", default=DEFAULT_ANALYSIS_MODEL)
     parser.add_argument("--evaluator-model", default=DEFAULT_EVALUATOR_MODEL)
     parser.add_argument("--run-id", help="Unique output directory name under runs/")
     args = parser.parse_args()
@@ -582,6 +654,7 @@ def main() -> None:
             timeout_seconds=args.timeout,
             video_model=args.video_model,
             prompt_model=args.prompt_model,
+            analysis_model=args.analysis_model,
             evaluator_model=args.evaluator_model,
             run_id=args.run_id,
         )

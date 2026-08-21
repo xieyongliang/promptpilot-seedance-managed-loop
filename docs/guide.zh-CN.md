@@ -1,6 +1,6 @@
 # ArkCLI + Managed Agent：视频生成、直接评测与持续改善
 
-本文给出一个可复现的 BytePlus ModelArk 工作流：Managed Agent 在 Cloud Environment 中运行单文件 Python Runner，由文本 LLM 生成或修订 Seedance Prompt，Seedance 生成多个候选视频，再由多模态 LLM 通过 `input_video` 直接观看、收听并评分。若未达到阈值，Runner 只修复最高优先级缺陷并进入下一轮。
+本文给出一个可复现的 BytePlus ModelArk 工作流：Managed Agent 在 Cloud Environment 中编排单文件 Python 模块，由文本 LLM 生成或修订 Seedance Prompt，Seedance 生成多个候选视频。评测分成两个阶段：第一步通过 `/responses + input_video` 提取精简视听证据；第二步由 MA 主模型直接读取证据并评分。若未达到阈值，MA 主模型只修复最高优先级缺陷并进入下一轮。
 
 默认策略是最多 5 轮、每轮 2 个候选、目标分数 3.5/5；所有值都可以由用户覆盖。
 
@@ -15,14 +15,15 @@ flowchart TB
     CLI --> MA["ModelArk Managed Agent<br/>Cloud Environment + bash"]
     VAULT["MA Vault<br/>注入 ARK_API_KEY"] --> MA
 
-    MA --> RUNNER["managed_video_loop.py"]
+    MA --> RUNNER["managed_video_loop.py<br/>生成与视频分析操作"]
     RUNNER --> PA["Prompt Agent<br/>文本 LLM 生成或修订 Prompt"]
     PA --> SD["Seedance<br/>同一 Prompt 生成 N 个候选"]
     SD --> C1["候选视频 1"]
     SD --> C2["候选视频 N"]
-    C1 --> EA["Evaluator Agent<br/>多模态 LLM + input_video"]
+    C1 --> EA["Analysis Agent<br/>多模态 LLM + input_video"]
     C2 --> EA
-    EA --> SCORE["结构化证据、0-5 分、置信度"]
+    EA --> EV["MA 主模型直接评分<br/>brief + 证据 JSON"]
+    EV --> SCORE["0-5 分、置信度、修复建议"]
     SCORE --> BEST["按 score + confidence 择优"]
     BEST --> CHECK{"最佳分数 >= 阈值?"}
     CHECK -->|"是"| DONE["下载最佳视频并结束"]
@@ -39,11 +40,11 @@ flowchart TB
     class MA,VAULT,RUNNER control;
     class PA prompt;
     class SD,C1,C2 video;
-    class EA,SCORE eval;
+    class EA,EV,SCORE eval;
     class BEST,CHECK,FIX,DONE decision;
 ```
 
-关键边界：把视频 URL 作为普通文本交给 MA，不等于模型已经看过视频。Runner 会调用 ModelArk Responses API，并把临时 URL 放入 `input_video.video_url`；这一步才是真正的视频与音频评测。
+关键边界：把视频 URL 作为普通文本交给 MA，不等于模型已经看过视频。第一步 Responses 调用会把完整临时签名 URL 放入 `input_video.video_url` 并提取视听证据；第二步由当前 MA 主模型直接处理证据 JSON 并评分。
 
 ## 2. 仓库结构
 
@@ -63,7 +64,7 @@ seedance-managed-video-loop/
     └── example-manifest.json
 ```
 
-`managed_video_loop.py` 是唯一运行入口，包含 Prompt 生成、Seedance 提交与轮询、直接视频评测、候选择优、单缺陷修复、提前停止和视频下载。
+`managed_video_loop.py` 提供 Prompt 生成、Seedance 提交与轮询、视频证据提取和本地运行能力。在推荐的 MA 路径中，Agent 负责调用这些操作，并由 MA 主模型完成证据评分、候选择优、单缺陷修复和提前停止。
 
 ## 3. 默认值与用户配置
 
@@ -75,7 +76,8 @@ seedance-managed-video-loop/
 | `--timeout` | `1200` | 每个视频任务的轮询超时秒数 |
 | `--video-model` | `dreamina-seedance-2-5-260628` | 视频生成模型 |
 | `--prompt-model` | `seed-2-0-lite-260428` | Prompt Agent 模型 |
-| `--evaluator-model` | `seed-2-0-lite-260428` | 直接视频评测模型 |
+| `--analysis-model` | `seed-2-0-lite-260428` | 视听证据提取模型 |
+| `--evaluator-model` | `seed-2-0-lite-260428` | 仅供独立 Runner 回退路径使用；推荐 MA 路径由 MA 主模型评分 |
 
 不传参数即使用默认值：
 
@@ -92,6 +94,7 @@ python managed_video_loop.py \
   --target-score 4.2 \
   --timeout 1800 \
   --prompt-model seed-2-0-lite-260428 \
+  --analysis-model seed-2-0-lite-260428 \
   --evaluator-model seed-2-0-lite-260428
 ```
 
@@ -159,16 +162,16 @@ export ARK_API_KEY="<your-modelark-api-key>"
 2. Runner 将原始 brief 追加为不可丢失约束，避免后续修订偏离目标。
 3. Seedance 使用完全相同的 Prompt 生成多个独立候选。
 4. Runner 轮询任务并取得临时 `video_url`。
-5. Evaluator Agent 通过 `input_video` 直接观看和收听每个候选。
-6. Evaluator 返回结构化证据、分数、置信度、通过项和失败项。
-7. Runner 按 `(score, confidence)` 选择最佳候选。
+5. Analysis Agent 通过一次 `/responses + input_video` 观看和收听每个候选，只返回精简视听证据，不评分。
+6. MA 主模型直接读取 brief 和证据 JSON，返回分数、置信度、通过项和失败项。
+7. MA 主模型按 `(score, confidence)` 选择最佳候选。
 8. 达到阈值即停止；否则只把最高优先级缺陷交给下一轮 Prompt Agent。
 
 缺陷优先级默认考虑：精确对白、视角、意外文字、时间线动作、连续性和音频。Evaluator 也会返回 `highest_priority_failure`，供下一轮定向修复。
 
-## 7. 直接视频评测契约
+## 7. 两阶段视频评测契约
 
-Evaluator 必须根据可观察证据评分，不能仅根据画面推断声音。返回 JSON 包含：
+Analysis Agent 不能仅根据画面推断声音，负责返回时间线、视觉证据、音频证据、精确对白、连续性和意外文字。MA 主模型读取这份证据，并根据 source brief 直接评分。合并后的 JSON 包含：
 
 - `score`：0-5
 - `confidence`：0-1
@@ -205,6 +208,7 @@ runs/<run-id>/
     ├── candidate-01/
     │   ├── seedance_submit.json
     │   ├── seedance_result.json
+    │   ├── llm_video_analysis.json
     │   ├── llm_video_evaluation.json
     │   └── summary.json
     └── candidate-02/
@@ -309,10 +313,9 @@ arkcli agent session resources add "$SESSION_ID" \
 ```bash
 arkcli agent session events send "$SESSION_ID" \
   --type user.message \
-  --text 'Run the mounted video loop. Use max 5 rounds, 2 candidates per round, target score 3.5, and timeout 1200 seconds. Never print credentials. Return the final manifest summary and selected video path.' \
+  --text 'Orchestrate the mounted video loop with max 5 rounds, 2 candidates per round, target score 3.5, and timeout 1200 seconds. For each candidate call analyze_video to obtain observable evidence. Then read that evidence and score it directly with your MA main model. Never print credentials. Return the final manifest summary and selected video path.' \
   --poll \
-  --wait-timeout 7200 \
-  --format json
+  --wait-timeout 7200
 ```
 
 若 polling 超时，继续查询同一个 Session，不要重复发送任务：
@@ -326,9 +329,10 @@ arkcli +tail "$SESSION_ID"
 
 - Prompt Agent 生成可直接提交给 Seedance 的 Prompt。
 - 同轮候选使用相同 Prompt，但 task ID 不同。
-- Evaluator 的请求包含 `input_video`，并返回视听证据。
+- Analysis Agent 的请求包含完整签名 URL 和 `input_video`，并返回视听证据。
+- MA 主模型直接读取视频分析证据并完成评分。
 - `audio_tokens > 0`，且输出包含对白、音乐或音效判断。
-- Evaluator 返回 0-5 分、置信度和最高优先级缺陷。
+- MA 主模型返回 0-5 分、置信度和最高优先级缺陷。
 - Runner 正确择优、达到阈值停止、未达到时只修一个缺陷。
 - 总轮数不超过用户配置。
 - Agent Session events 中出现 bash 调用和 Runner 输出。
@@ -347,4 +351,5 @@ arkcli +tail "$SESSION_ID"
 - Python 编译和 CLI 默认值已验证。
 - 离线模拟测试覆盖 Prompt 解析、直接视频评测 payload、候选择优和聚焦修复。
 - MA Environment 和 Agent 创建请求可通过 ArkCLI `--dry-run` 验证。
-- 修改后的无外部评测版本仍需完成一次真实 MA Cloud Session 端到端运行。
+- 直接使用 `seed-2-0-lite + input_video` 调用 Responses API 已完成真实视频评测。
+- 真实 MA Cloud Session 已完成“`/responses` 视频理解 + MA 主模型直接读取证据并评分”的完整流程。
